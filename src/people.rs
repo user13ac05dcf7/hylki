@@ -47,6 +47,12 @@ pub struct Header {
     pub message_id: String,
 }
 
+impl Header {
+    fn mail(&self) -> Mail<'_> {
+        Mail { from_name: &self.from_name, from_addr: &self.from_addr, to: &self.to, cc: &self.cc }
+    }
+}
+
 impl From<&crate::models::Message> for Header {
     fn from(m: &crate::models::Message) -> Header {
         Header {
@@ -58,6 +64,28 @@ impl From<&crate::models::Message> for Header {
             unread: m.unread,
             message_id: m.message_id.clone(),
         }
+    }
+}
+
+/// Who a message is from and to, borrowed from a message or a [`Header`].
+#[derive(Debug, Clone, Copy)]
+pub struct Mail<'a> {
+    pub from_name: &'a str,
+    pub from_addr: &'a str,
+    pub to: &'a str,
+    pub cc: &'a str,
+}
+
+impl<'a> From<&'a crate::models::Message> for Mail<'a> {
+    fn from(m: &'a crate::models::Message) -> Mail<'a> {
+        Mail { from_name: &m.from_name, from_addr: &m.from_addr, to: &m.to, cc: &m.cc }
+    }
+}
+
+impl Mail<'_> {
+    /// The sender's address, lower case.
+    fn from_lower(&self) -> String {
+        self.from_addr.trim().to_lowercase()
     }
 }
 
@@ -74,8 +102,14 @@ impl Own {
             .collect())
     }
 
-    pub fn contains(&self, address: &str) -> bool {
-        self.0.contains(&address.trim().to_lowercase())
+    /// Whether a lower-case address is one of the user's.
+    pub fn contains(&self, lower: &str) -> bool {
+        self.0.contains(lower)
+    }
+
+    /// Whether the user sent the mail.
+    pub fn sent(&self, m: Mail) -> bool {
+        self.contains(&m.from_lower())
     }
 }
 
@@ -89,24 +123,38 @@ fn recipients(field: &str) -> impl Iterator<Item = (String, String)> + '_ {
 
 /// The people a message belongs to, with the name it gives each: its sender
 /// for incoming mail, every recipient but the user for mail the user sent.
-pub fn counterparts(h: &Header, own: &Own) -> Vec<(String, String)> {
-    let from = h.from_addr.trim().to_lowercase();
+pub fn counterparts(m: Mail, own: &Own) -> Vec<(String, String)> {
+    let from = m.from_lower();
     let mut out: Vec<(String, String)> = Vec::new();
     if own.contains(&from) {
-        for (name, addr) in recipients(&h.to).chain(recipients(&h.cc)) {
+        for (name, addr) in recipients(m.to).chain(recipients(m.cc)) {
             if !own.contains(&addr) && !out.iter().any(|(a, _)| *a == addr) {
                 out.push((addr, name));
             }
         }
     } else if from.contains('@') {
-        out.push((from, h.from_name.trim().to_string()));
+        out.push((from, m.from_name.trim().to_string()));
     }
     out
 }
 
-/// Whether a message belongs to `address`'s view.
-pub fn involves(h: &Header, own: &Own, address: &str) -> bool {
-    counterparts(h, own).iter().any(|(a, _)| a == address)
+/// Whether a message belongs to anyone's view (All People): incoming mail
+/// with a sender, or sent mail with a recipient other than the user.
+pub fn has_counterpart(m: Mail, own: &Own) -> bool {
+    let from = m.from_lower();
+    if !own.contains(&from) {
+        return from.contains('@');
+    }
+    recipients(m.to).chain(recipients(m.cc)).any(|(_, a)| !own.contains(&a))
+}
+
+/// Whether a message belongs to `address`'s view (lower case).
+pub fn involves(m: Mail, own: &Own, address: &str) -> bool {
+    let from = m.from_lower();
+    if !own.contains(&from) {
+        return from == address;
+    }
+    recipients(m.to).chain(recipients(m.cc)).any(|(_, a)| a == address)
 }
 
 /// A name worth showing: not empty and not just an address.
@@ -123,10 +171,11 @@ pub fn people(headers: &[Header], own: &Own) -> Vec<Person> {
         if !h.message_id.is_empty() && !seen.insert(h.message_id.as_str()) {
             continue;
         }
-        let incoming = !own.contains(&h.from_addr);
-        for (addr, name) in counterparts(h, own) {
-            let (p, own_name) = by_addr.entry(addr.clone()).or_insert_with(|| {
-                (Person { address: addr, name: String::new(), latest: 0, unread: 0, total: 0 }, false)
+        let incoming = !own.sent(h.mail());
+        for (addr, name) in counterparts(h.mail(), own) {
+            let (p, own_name) = by_addr.entry(addr).or_insert_with_key(|addr| {
+                let p = Person { address: addr.clone(), name: String::new(), latest: 0, unread: 0, total: 0 };
+                (p, false)
             });
             p.total += 1;
             if incoming && h.unread {
@@ -168,9 +217,9 @@ mod tests {
     #[test]
     fn incoming_mail_belongs_to_its_sender_only() {
         let m = h("Ada <Ada@x.com>", "me@example.com", "bob@x.com", 1, false, "a");
-        assert_eq!(counterparts(&m, &own()), vec![("ada@x.com".into(), "Ada".into())]);
+        assert_eq!(counterparts(m.mail(), &own()), vec![("ada@x.com".into(), "Ada".into())]);
         // Bob was only on Cc of Ada's mail: not his conversation.
-        assert!(!involves(&m, &own(), "bob@x.com"));
+        assert!(!involves(m.mail(), &own(), "bob@x.com"));
     }
 
     #[test]
@@ -183,7 +232,7 @@ mod tests {
             false,
             "a",
         );
-        let c = counterparts(&m, &own());
+        let c = counterparts(m.mail(), &own());
         assert_eq!(c, vec![
             ("ada@x.com".into(), "Ada".into()),
             ("bob@x.com".into(), "Smith, Bob".into()),
@@ -193,8 +242,8 @@ mod tests {
     #[test]
     fn mail_from_an_alias_counts_as_sent() {
         let m = h("alias@example.org", "carol@x.com", "", 1, false, "a");
-        assert!(involves(&m, &own(), "carol@x.com"));
-        assert!(!involves(&m, &own(), "alias@example.org"));
+        assert!(involves(m.mail(), &own(), "carol@x.com"));
+        assert!(!involves(m.mail(), &own(), "alias@example.org"));
     }
 
     #[test]
@@ -215,6 +264,16 @@ mod tests {
         assert_eq!(p[0].name, "Ada");
         assert_eq!((p[1].total, p[1].unread), (1, 1));
         assert_eq!(p[2].display_name(), "dave");
+    }
+
+    #[test]
+    fn all_people_holds_mail_with_someone_else_in_it() {
+        let to_me_only = h("me@example.com", "alias@example.org", "", 1, false, "a");
+        assert!(!has_counterpart(to_me_only.mail(), &own()));
+        let to_ada = h("me@example.com", "alias@example.org", "ada@x.com", 1, false, "b");
+        assert!(has_counterpart(to_ada.mail(), &own()));
+        let from_ada = h("Ada <ada@x.com>", "me@example.com", "", 1, false, "c");
+        assert!(has_counterpart(from_ada.mail(), &own()));
     }
 
     #[test]

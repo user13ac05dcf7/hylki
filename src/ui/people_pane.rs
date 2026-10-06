@@ -19,6 +19,7 @@ use relm4::prelude::*;
 use crate::i18n::i18n;
 use crate::people::Person;
 use crate::ui::context_menu::{show_context_menu, MenuEntry};
+use crate::ui::sidebar::{pin_icon_size, style_badge};
 
 /// One person's row and the parts updated in place.
 struct Row {
@@ -26,12 +27,15 @@ struct Row {
     avatar: adw::Avatar,
     name: gtk::Label,
     badge: gtk::Label,
+    unread: u32,
 }
 
 pub struct PeoplePane {
     list: gtk::ListBox,
     all_row: gtk::ListBoxRow,
     all_badge: gtk::Label,
+    /// Everyone's unread mail, for the All People badge.
+    all_unread: u32,
     rows: HashMap<String, Row>,
     /// The addresses in list order (after All People).
     order: Vec<String>,
@@ -44,10 +48,12 @@ pub struct PeoplePane {
     quiet: Rc<Cell<bool>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PeoplePaneInput {
     /// The People list, most recent first.
     SetPeople(Vec<Person>),
+    /// One person's unread count changed (mail read or marked unread).
+    SetUnread { address: String, unread: u32 },
     /// Highlight a person (`None`: All People) without reporting it.
     Select(Option<String>),
     /// A row was picked (its index in the list).
@@ -99,7 +105,7 @@ impl SimpleComponent for PeoplePane {
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         hbox.add_css_class("folder-row");
         let icon = gtk::Image::from_icon_name("system-users-symbolic");
-        icon.set_pixel_size(16);
+        pin_icon_size(&icon);
         icon.set_size_request(28, -1);
         icon.add_css_class("folder-icon");
         hbox.append(&icon);
@@ -160,6 +166,7 @@ impl SimpleComponent for PeoplePane {
             list,
             all_row,
             all_badge,
+            all_unread: 0,
             rows: HashMap::new(),
             order: Vec::new(),
             haystack,
@@ -173,18 +180,20 @@ impl SimpleComponent for PeoplePane {
     fn update(&mut self, msg: PeoplePaneInput, sender: ComponentSender<Self>) {
         match msg {
             PeoplePaneInput::SetPeople(people) => self.set_people(people),
+            PeoplePaneInput::SetUnread { address, unread } => {
+                let Some(r) = self.rows.get_mut(&address) else { return };
+                self.all_unread = self.all_unread - r.unread + unread;
+                r.unread = unread;
+                set_count(&r.badge, unread);
+                set_count(&self.all_badge, self.all_unread);
+            }
             PeoplePaneInput::Select(address) => {
                 self.selected = address;
                 self.highlight();
             }
             PeoplePaneInput::Picked(index) => {
-                let address = match index {
-                    0 => None,
-                    i => match self.order.get(i as usize - 1) {
-                        Some(a) => Some(a.clone()),
-                        None => return,
-                    },
-                };
+                let Some(address) = self.address_at(index) else { return };
+                let address = address.cloned();
                 if address != self.selected {
                     self.selected = address.clone();
                     let _ = sender.output(PeoplePaneOutput::Selected(address));
@@ -192,8 +201,7 @@ impl SimpleComponent for PeoplePane {
             }
             PeoplePaneInput::Menu { x, y } => {
                 let Some(row) = self.list.row_at_y(y as i32) else { return };
-                let Some(address) = self.order.get((row.index() as usize).wrapping_sub(1)).cloned()
-                else {
+                let Some(Some(address)) = self.address_at(row.index()).map(|a| a.cloned()) else {
                     return;
                 };
                 let s = sender.output_sender().clone();
@@ -221,43 +229,55 @@ impl SimpleComponent for PeoplePane {
 
 impl PeoplePane {
     fn set_people(&mut self, people: Vec<Person>) {
-        let order: Vec<String> = people.iter().map(|p| p.address.clone()).collect();
-        let mut unread = 0;
+        self.all_unread = 0;
         for p in &people {
-            unread += p.unread;
+            self.all_unread += p.unread;
             let r = self.rows.entry(p.address.clone()).or_insert_with(|| person_row(&p.address));
             let name = p.display_name();
             if r.name.label() != name {
                 r.name.set_label(name);
                 r.avatar.set_text(Some(name));
+                self.haystack
+                    .borrow_mut()
+                    .insert(r.row.clone(), format!("{} {}", p.name.to_lowercase(), p.address));
             }
+            r.unread = p.unread;
             set_count(&r.badge, p.unread);
-            r.row.set_tooltip_text(Some(&p.address));
-            self.haystack
-                .borrow_mut()
-                .insert(r.row.clone(), format!("{} {}", p.name.to_lowercase(), p.address));
         }
-        set_count(&self.all_badge, unread);
-        if order != self.order {
-            self.quiet.set(true);
-            for address in &self.order {
-                if let Some(r) = self.rows.get(address) {
-                    self.list.remove(&r.row);
-                }
+        set_count(&self.all_badge, self.all_unread);
+        let same_order = people.len() == self.order.len()
+            && people.iter().zip(&self.order).all(|(p, a)| p.address == *a);
+        if same_order {
+            return;
+        }
+        self.quiet.set(true);
+        for address in &self.order {
+            if let Some(r) = self.rows.get(address) {
+                self.list.remove(&r.row);
             }
-            let keep: std::collections::HashSet<&String> = order.iter().collect();
-            let gone: Vec<String> = self.rows.keys().filter(|a| !keep.contains(a)).cloned().collect();
-            for address in gone {
-                if let Some(r) = self.rows.remove(&address) {
-                    self.haystack.borrow_mut().remove(&r.row);
-                }
+        }
+        self.order = people.into_iter().map(|p| p.address).collect();
+        let keep: std::collections::HashSet<&String> = self.order.iter().collect();
+        let gone: Vec<String> = self.rows.keys().filter(|a| !keep.contains(a)).cloned().collect();
+        for address in gone {
+            if let Some(r) = self.rows.remove(&address) {
+                self.haystack.borrow_mut().remove(&r.row);
             }
-            for address in &order {
-                self.list.append(&self.rows[address].row);
-            }
-            self.order = order;
-            self.quiet.set(false);
-            self.highlight();
+        }
+        for address in &self.order {
+            self.list.append(&self.rows[address].row);
+        }
+        self.quiet.set(false);
+        self.highlight();
+    }
+
+    /// The person a list row stands for: `Some(None)` for All People (row
+    /// 0), `None` past the end.
+    fn address_at(&self, index: i32) -> Option<Option<&String>> {
+        match index {
+            0 => Some(None),
+            i if i > 0 => self.order.get(i as usize - 1).map(Some),
+            _ => None,
         }
     }
 
@@ -278,8 +298,7 @@ impl PeoplePane {
 
 fn badge() -> gtk::Label {
     let badge = gtk::Label::new(None);
-    badge.add_css_class("unread-badge");
-    badge.set_valign(gtk::Align::Center);
+    style_badge(&badge, 5);
     badge.set_visible(false);
     badge
 }
@@ -307,5 +326,6 @@ fn person_row(address: &str) -> Row {
     let badge = badge();
     hbox.append(&badge);
     row.set_child(Some(&hbox));
-    Row { row, avatar, name, badge }
+    row.set_tooltip_text(Some(address));
+    Row { row, avatar, name, badge, unread: 0 }
 }

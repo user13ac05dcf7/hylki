@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS messages (
     PRIMARY KEY (account_id, folder_path, uid)
 );
 CREATE INDEX IF NOT EXISTS messages_by_message_id ON messages (message_id);
+CREATE INDEX IF NOT EXISTS messages_by_account_ts ON messages (account_id, ts);
 CREATE TABLE IF NOT EXISTS local_tags (
     account_id  INTEGER NOT NULL,
     message_id  TEXT    NOT NULL,
@@ -2138,11 +2139,7 @@ impl Cache {
              ORDER BY ts DESC LIMIT ?3",
             cols = summary_cols()
         );
-        self.summaries(&sql, params![account_id, needle, TAG_VIEW_LIMIT], account_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!("cache messages_with_keyword failed: {e}");
-                Vec::new()
-            })
+        self.summaries("messages_with_keyword", &sql, params![account_id, needle, TAG_VIEW_LIMIT], account_id)
     }
 
     /// The header fields of every cached message of the account, with the
@@ -2189,11 +2186,7 @@ impl Cache {
              ORDER BY ts DESC LIMIT ?3",
             cols = summary_cols()
         );
-        self.summaries(&sql, params![account_id, address, TAG_VIEW_LIMIT], account_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!("cache messages_with_address failed: {e}");
-                Vec::new()
-            })
+        self.summaries("messages_with_address", &sql, params![account_id, address, TAG_VIEW_LIMIT], account_id)
     }
 
     /// The account's newest cached messages, any folder, with the folder
@@ -2203,16 +2196,26 @@ impl Cache {
             "SELECT {cols} FROM messages WHERE account_id = ?1 ORDER BY ts DESC LIMIT ?2",
             cols = summary_cols()
         );
-        self.summaries(&sql, params![account_id, TAG_VIEW_LIMIT], account_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!("cache recent_messages failed: {e}");
-                Vec::new()
-            })
+        self.summaries("recent_messages", &sql, params![account_id, TAG_VIEW_LIMIT], account_id)
     }
 
     /// Run a query selecting [`summary_cols`] into (folder path, message)
-    /// pairs. `folder_id` is left 0 for the caller, which knows the ids.
+    /// pairs; on failure log it under `what` and answer none. `folder_id`
+    /// is left 0 for the caller, which knows the ids.
     fn summaries(
+        &self,
+        what: &str,
+        sql: &str,
+        params: impl rusqlite::Params,
+        account_id: u32,
+    ) -> Vec<(String, Message)> {
+        self.try_summaries(sql, params, account_id).unwrap_or_else(|e| {
+            tracing::warn!("cache {what} failed: {e}");
+            Vec::new()
+        })
+    }
+
+    fn try_summaries(
         &self,
         sql: &str,
         params: impl rusqlite::Params,
