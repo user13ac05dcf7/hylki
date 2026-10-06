@@ -100,6 +100,10 @@ CREATE TABLE IF NOT EXISTS addresses (
     name  TEXT NOT NULL DEFAULT '',
     count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS people_list (
+    id   INTEGER PRIMARY KEY CHECK (id = 1),
+    data TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS outbox (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id  INTEGER NOT NULL,
@@ -2142,6 +2146,26 @@ impl Cache {
         self.summaries("messages_with_keyword", &sql, params![account_id, needle, TAG_VIEW_LIMIT], account_id)
     }
 
+    /// The People list as last counted, shown at once at startup while
+    /// it is counted afresh behind.
+    pub fn load_people(&self) -> Vec<crate::people::Person> {
+        self.conn
+            .query_row("SELECT data FROM people_list WHERE id = 1", [], |row| row.get::<_, String>(0))
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_people(&self, people: &[crate::people::Person]) {
+        let Ok(data) = serde_json::to_string(people) else { return };
+        if let Err(e) = self.conn.execute(
+            "INSERT OR REPLACE INTO people_list (id, data) VALUES (1, ?1)",
+            params![data],
+        ) {
+            tracing::warn!("cache save_people failed: {e}");
+        }
+    }
+
     /// The header fields of every cached message of the account, with the
     /// folder each sits in: what the People list (`crate::people`) is
     /// counted from. Only the narrow columns are read, so it stays cheap on
@@ -2503,6 +2527,23 @@ mod tests {
             importance: crate::models::Importance::default(),
             due: 0,
         }
+    }
+
+    #[test]
+    fn people_list_is_kept_between_runs() {
+        let c = Cache::in_memory().unwrap();
+        assert!(c.load_people().is_empty());
+        let ada = crate::people::Person {
+            address: "ada@x.com".into(),
+            name: "Ada".into(),
+            latest: 30,
+            unread: 2,
+            total: 5,
+        };
+        c.save_people(&[ada.clone()]);
+        let bob = crate::people::Person { address: "bob@x.com".into(), name: String::new(), ..ada.clone() };
+        c.save_people(&[bob.clone(), ada.clone()]);
+        assert_eq!(c.load_people(), vec![bob, ada]);
     }
 
     #[test]
