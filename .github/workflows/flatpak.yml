@@ -20,7 +20,9 @@ concurrency:
 
 env:
   PUBLISH_REF: refs/heads/flatpak-ci
-  APP_ID: co.hyprlab.Hylki
+  # The fork's own app ID (tools/fork-app-id.sh), so it installs beside
+  # Hylki's own Flatpak rather than in its place.
+  APP_ID: io.github.user13ac05dcf7.Hylki
   COLLECTION_ID: io.github.user13ac05dcf7.Hylki
 
 jobs:
@@ -31,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Give the build the fork's app ID
+        run: tools/fork-app-id.sh "$APP_ID"
+
       - name: Install flatpak-builder
         run: |
           sudo apt-get update
@@ -39,7 +44,7 @@ jobs:
       - name: Install the GNOME runtime and Rust SDK extension
         run: |
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          version=$(sed -n "s/^runtime-version: '\(.*\)'/\1/p" co.hyprlab.Hylki.yml)
+          version=$(sed -n "s/^runtime-version: '\(.*\)'/\1/p" "$APP_ID.yml")
           for attempt in 1 2 3; do
             flatpak install --user -y --noninteractive --no-static-deltas flathub \
               "org.gnome.Platform//$version" "org.gnome.Sdk//$version" \
@@ -68,8 +73,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .flatpak-builder
-          key: flatpak-builder-${{ hashFiles('co.hyprlab.Hylki.yml') }}-${{ github.sha }}
-          restore-keys: flatpak-builder-${{ hashFiles('co.hyprlab.Hylki.yml') }}-
+          key: flatpak-builder-${{ hashFiles(format('{0}.yml', env.APP_ID)) }}-${{ github.sha }}
+          restore-keys: flatpak-builder-${{ hashFiles(format('{0}.yml', env.APP_ID)) }}-
 
       # Without the secret the build still makes the bundle; only the signed
       # repository is left out.
