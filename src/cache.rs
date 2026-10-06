@@ -2546,6 +2546,74 @@ mod tests {
         assert_eq!(tagged[0].1.keywords, ["$label1"]);
     }
 
+    /// How the People view's reads scale on a large synthetic mailbox:
+    /// `cargo test --bin hylki cache::tests::people_timing -- --ignored
+    /// --nocapture`. Two accounts of 60,000 messages; a few of ~6,000
+    /// people write most of the mail, one in seven is sent mail to one to
+    /// three of them, and one in five incoming has a list on Cc.
+    #[test]
+    #[ignore]
+    fn people_timing() {
+        use std::time::Instant;
+        let c = Cache::in_memory().unwrap();
+        let own = crate::people::Own::new(["me@example.com"]);
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for account in 1..=2u32 {
+            let (mut inbox, mut sent) = (Vec::new(), Vec::new());
+            for uid in 1..=60_000u32 {
+                let r = next();
+                let p = (((r % 1000) as f64 / 1000.0).powi(3) * 6000.0) as u32;
+                let ts = i64::from(uid) * 60;
+                if r % 7 == 0 {
+                    let to = (0..1 + (r >> 8) % 3)
+                        .map(|k| format!("Person {0} <person{0}@example.org>", p + k as u32))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    sent.push(summary(uid, ("Me", "me@example.com"), &to, "", ts));
+                } else {
+                    let cc = if r % 5 == 0 { "list@example.org" } else { "" };
+                    let from = (format!("Person {p}"), format!("person{p}@example.org"));
+                    inbox.push(summary(uid, (&from.0, &from.1), "me@example.com", cc, ts));
+                }
+            }
+            c.save_messages(account, "INBOX", &inbox);
+            c.save_messages(account, "Sent", &sent);
+        }
+
+        let at = Instant::now();
+        let headers: Vec<crate::people::Header> =
+            (1..=2).flat_map(|a| c.people_headers(a)).map(|(_, h)| h).collect();
+        let read = at.elapsed();
+        let people = crate::people::people(&headers, &own);
+        println!(
+            "People list: {} headers read in {read:?}, {} people counted in {:?}",
+            headers.len(),
+            people.len(),
+            at.elapsed() - read
+        );
+        let frequent = people.iter().max_by_key(|p| p.total).unwrap().address.clone();
+        let rare = people.iter().min_by_key(|p| p.total).unwrap().address.clone();
+        for (label, person) in [("frequent", Some(frequent)), ("rare", Some(rare)), ("All People", None)] {
+            let at = Instant::now();
+            let n: usize = (1..=2)
+                .map(|a| {
+                    c.people_messages(a, person.as_deref(), |_, m| match &person {
+                        Some(address) => crate::people::involves(m, &own, address),
+                        None => crate::people::has_counterpart(m, &own),
+                    })
+                    .len()
+                })
+                .sum();
+            println!("{label} ({person:?}): {n} messages in {:?}", at.elapsed());
+        }
+    }
+
     #[test]
     fn message_ids_go_back_on_the_wire_in_the_case_they_arrived() {
         let c = Cache::in_memory().unwrap();

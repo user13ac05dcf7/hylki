@@ -430,6 +430,10 @@ impl HandOffFiles {
     }
 }
 
+/// The least time between two counts of the People list (a full read of
+/// every account's headers) while mail keeps arriving.
+const PEOPLE_RECOUNT_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A message list read from the on-disk index rather than from one folder.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IndexView {
@@ -817,6 +821,10 @@ pub struct AppModel {
     /// The next read of a People view keeps the People list as it is:
     /// only the person changed, not the mail.
     people_keep_count: bool,
+    /// When the People list was last counted, and whether a count is
+    /// waiting for the pause after it to pass.
+    people_counted_at: Option<std::time::Instant>,
+    people_recount_queued: bool,
     /// Whether the settings window opens on Accounts (vs Preferences).
     settings_open_accounts: bool,
     /// The Settings category last shown this session, to reopen on.
@@ -1768,6 +1776,8 @@ pub enum AppMsg {
     SetPeopleMode(bool),
     /// A person was picked in the People pane (`None`: All People).
     PersonSelected(Option<String>),
+    /// Count the People list again, after a pause in which it was not.
+    PeopleRecount,
     /// Put a tag on one message, or take it off (row menu, palette, card).
     SetTag { message: Box<Message>, keyword: String, add: bool },
     /// Put a tag on several messages, or take it off (the list's bulk bar).
@@ -3402,6 +3412,8 @@ impl SimpleComponent for AppModel {
             people_toggles_quiet,
             people: Vec::new(),
             people_keep_count: false,
+            people_counted_at: None,
+            people_recount_queued: false,
             settings_open_accounts: prefs.settings_open_accounts,
             last_settings_page: None,
             list_count: String::new(),
@@ -9256,6 +9268,14 @@ impl SimpleComponent for AppModel {
                         path: f.path.clone(),
                     });
                     self.select_folder(account_id, f.id, f.name, f.path);
+                }
+            }
+
+            AppMsg::PeopleRecount => {
+                self.people_recount_queued = false;
+                self.people_counted_at = None;
+                if matches!(self.index_view, Some(IndexView::People(_))) {
+                    self.refresh_index_view(&sender);
                 }
             }
 
@@ -18192,7 +18212,21 @@ impl AppModel {
     fn refresh_index_view(&mut self, sender: &ComponentSender<Self>) {
         let Some(key) = self.index_view.clone() else { return };
         let people_view = matches!(key, IndexView::People(_));
-        let count = people_view && !std::mem::take(&mut self.people_keep_count);
+        let mut count = people_view && !std::mem::take(&mut self.people_keep_count);
+        // While a sync lands folder after folder, the list is counted at
+        // most every PEOPLE_RECOUNT_PAUSE, and once more after the last.
+        if count && self.people_counted_at.is_some_and(|t| t.elapsed() < PEOPLE_RECOUNT_PAUSE) {
+            count = false;
+            if !std::mem::replace(&mut self.people_recount_queued, true) {
+                let s = sender.input_sender().clone();
+                gtk::glib::timeout_add_local_once(PEOPLE_RECOUNT_PAUSE, move || {
+                    let _ = s.send(AppMsg::PeopleRecount);
+                });
+            }
+        }
+        if count {
+            self.people_counted_at = Some(std::time::Instant::now());
+        }
         if demo_mode() && self.config.is_empty() {
             if count {
                 let headers: Vec<crate::people::Header> = self
