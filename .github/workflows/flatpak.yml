@@ -1,9 +1,10 @@
-name: Flatpak
+name: CI
 
-# Builds this fork's x86_64 Flatpak from the checkout, with the release
-# manifest's recipe (tools/local-manifest.sh). Every push gets a bundle to
-# try as an artifact; pushes to PUBLISH_REF are also signed and published as
-# a Flatpak repository on GitHub Pages.
+# Runs the test suite and builds this fork's x86_64 Flatpak from the
+# checkout, with the release manifest's recipe (tools/local-manifest.sh).
+# Every push gets a bundle to try as an artifact; pushes to PUBLISH_REF are
+# also signed and, once the tests pass, published as a Flatpak repository
+# on GitHub Pages.
 
 on:
   push:
@@ -26,6 +27,34 @@ env:
   COLLECTION_ID: io.github.user13ac05dcf7.Hylki
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    # Fedora carries the libadwaita the crate's v1_7 feature needs; Ubuntu
+    # 24.04 does not.
+    container: registry.fedoraproject.org/fedora:45
+    timeout-minutes: 90
+    steps:
+      - name: Install the toolchain and libraries
+        run: |
+          dnf install -y -q cargo rust gcc gcc-c++ git gtk4-devel libadwaita-devel \
+            webkitgtk6.0-devel poppler-glib-devel openssl-devel dbus-devel \
+            gettext-devel wayland-devel
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-
+
+      - name: Run the tests
+        run: cargo test --locked
+
   build:
     name: Build x86_64
     runs-on: ubuntu-24.04
@@ -55,8 +84,9 @@ jobs:
 
       - name: Vendor the crate sources
         run: |
+          # Pinned: this job goes on to sign what it builds.
           curl -fsSL -o /tmp/gen-cargo-sources.py \
-            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/74697c75b630d7330e77250fc13cb5ea688d9479/cargo/flatpak-cargo-generator.py
           for attempt in 1 2 3; do
             if python3 /tmp/gen-cargo-sources.py Cargo.lock -o cargo-sources.json 2>/tmp/gen.err; then
               break
@@ -159,7 +189,7 @@ jobs:
 
   publish:
     name: Publish to GitHub Pages
-    needs: build
+    needs: [test, build]
     if: needs.build.outputs.signed == 'true'
     runs-on: ubuntu-24.04
     permissions:
