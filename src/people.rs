@@ -32,13 +32,6 @@ impl Person {
             _ => &self.address,
         }
     }
-
-    /// Whether a filter text (lower case) matches the name or the address.
-    pub fn matches(&self, needle: &str) -> bool {
-        needle.is_empty()
-            || self.address.contains(needle)
-            || self.name.to_lowercase().contains(needle)
-    }
 }
 
 /// The header fields the People view needs of a cached message.
@@ -222,8 +215,6 @@ mod tests {
         assert_eq!(p[0].name, "Ada");
         assert_eq!((p[1].total, p[1].unread), (1, 1));
         assert_eq!(p[2].display_name(), "dave");
-        assert!(p[0].matches("ada"));
-        assert!(!p[0].matches("bob"));
     }
 
     #[test]
