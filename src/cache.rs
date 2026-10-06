@@ -2174,29 +2174,56 @@ impl Cache {
         })
     }
 
-    /// Cached messages of the account naming `address` (lower case) as
-    /// sender or recipient, newest first, with the folder each sits in. A
-    /// coarse match: the caller keeps the ones that belong to the person
-    /// (`crate::people::involves`).
-    pub fn messages_with_address(&self, account_id: u32, address: &str) -> Vec<(String, Message)> {
+    /// The account's mail for the People view, newest first, with the
+    /// folder each sits in: the messages `keep` accepts (by folder path and
+    /// who they are from and to), at most [`TAG_VIEW_LIMIT`]. Given an
+    /// address (lower case), only rows naming it somewhere in the headers
+    /// are looked at. The narrow columns are read and judged first, so mail
+    /// that does not belong (a Cc on someone else's, a look-alike address,
+    /// Junk) never takes a place under the limit; then the kept rows are
+    /// read in full.
+    pub fn people_messages(
+        &self,
+        account_id: u32,
+        address: Option<&str>,
+        keep: impl Fn(&str, crate::people::Mail) -> bool,
+    ) -> Vec<(String, Message)> {
+        let pick = || -> rusqlite::Result<Vec<i64>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT rowid, folder_path, from_name, from_addr, recipients, cc FROM messages \
+                 WHERE account_id = ?1 \
+                   AND (?2 IS NULL OR instr(lower(from_addr || ',' || recipients || ',' || cc), ?2) > 0) \
+                 ORDER BY ts DESC",
+            )?;
+            let mut rows = stmt.query(params![account_id, address])?;
+            let mut kept = Vec::new();
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(1)?;
+                let (from_name, from_addr): (String, String) = (row.get(2)?, row.get(3)?);
+                let (to, cc): (String, String) = (row.get(4)?, row.get(5)?);
+                let mail = crate::people::Mail { from_name: &from_name, from_addr: &from_addr, to: &to, cc: &cc };
+                if keep(&path, mail) {
+                    kept.push(row.get(0)?);
+                    if kept.len() as i64 >= TAG_VIEW_LIMIT {
+                        break;
+                    }
+                }
+            }
+            Ok(kept)
+        };
+        let rowids = pick().unwrap_or_else(|e| {
+            tracing::warn!("cache people_messages failed: {e}");
+            Vec::new()
+        });
+        if rowids.is_empty() {
+            return Vec::new();
+        }
         let sql = format!(
-            "SELECT {cols} FROM messages \
-             WHERE account_id = ?1 \
-               AND instr(lower(from_addr || ',' || recipients || ',' || cc), ?2) > 0 \
-             ORDER BY ts DESC LIMIT ?3",
-            cols = summary_cols()
+            "SELECT {cols} FROM messages WHERE rowid IN ({ids}) ORDER BY ts DESC",
+            cols = summary_cols(),
+            ids = rowid_list(&rowids)
         );
-        self.summaries("messages_with_address", &sql, params![account_id, address, TAG_VIEW_LIMIT], account_id)
-    }
-
-    /// The account's newest cached messages, any folder, with the folder
-    /// each sits in: All People reads these.
-    pub fn recent_messages(&self, account_id: u32) -> Vec<(String, Message)> {
-        let sql = format!(
-            "SELECT {cols} FROM messages WHERE account_id = ?1 ORDER BY ts DESC LIMIT ?2",
-            cols = summary_cols()
-        );
-        self.summaries("recent_messages", &sql, params![account_id, TAG_VIEW_LIMIT], account_id)
+        self.summaries("people_messages", &sql, [], account_id)
     }
 
     /// Run a query selecting [`summary_cols`] into (folder path, message)
@@ -2479,31 +2506,43 @@ mod tests {
     }
 
     #[test]
-    fn people_queries_read_headers_and_find_mail_by_address() {
+    fn people_queries_read_headers_and_find_a_persons_mail() {
         let c = Cache::in_memory().unwrap();
         c.save_messages(1, "INBOX", &[
             summary(1, ("Ada", "Ada@x.com"), "me@example.com", "", 10),
             summary(2, ("Bob", "bob@x.com"), "me@example.com", "ada@x.com", 20),
+            summary(5, ("Hal", "hal@x.com"), "me@example.com", "", 50),
         ]);
         c.save_messages(1, "Sent", &[summary(3, ("Me", "me@example.com"), "Ada <ada@x.com>", "", 30)]);
+        c.save_messages(1, "Junk", &[summary(6, ("Ada", "ada@x.com"), "me@example.com", "", 60)]);
         c.save_messages(2, "INBOX", &[summary(4, ("Ada", "ada@x.com"), "other@example.com", "", 40)]);
 
         let headers = c.people_headers(1);
-        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.len(), 5);
         assert!(headers.iter().any(|(path, h)| path == "Sent" && h.to == "Ada <ada@x.com>"));
 
-        // Coarse: every mail of the account naming Ada, newest first, any
-        // folder; the Cc one is the caller's to drop (people::involves).
-        let uids: Vec<u32> = c.messages_with_address(1, "ada@x.com").iter().map(|(_, m)| m.uid).collect();
-        assert_eq!(uids, [3, 2, 1]);
-        assert!(c.messages_with_address(1, "carol@x.com").is_empty());
-        let recent: Vec<u32> = c.recent_messages(1).iter().map(|(_, m)| m.uid).collect();
-        assert_eq!(recent, [3, 2, 1]);
+        // Ada's view: hers and the mail sent to her, newest first. Bob's
+        // mail with her on Cc and the Junk copy are judged out before the
+        // limit, and a look-alike address never matches.
+        let own = crate::people::Own::new(["me@example.com"]);
+        let ada = |path: &str, m: crate::people::Mail| {
+            path != "Junk" && crate::people::involves(m, &own, "ada@x.com")
+        };
+        let uids: Vec<u32> = c.people_messages(1, Some("ada@x.com"), ada).iter().map(|(_, m)| m.uid).collect();
+        assert_eq!(uids, [3, 1]);
+        let al = |_: &str, m: crate::people::Mail| crate::people::involves(m, &own, "al@x.com");
+        assert!(c.people_messages(1, Some("al@x.com"), al).is_empty());
+        // All People: everything with someone in it, outside Junk.
+        let anyone = |path: &str, m: crate::people::Mail| {
+            path != "Junk" && crate::people::has_counterpart(m, &own)
+        };
+        let all: Vec<u32> = c.people_messages(1, None, anyone).iter().map(|(_, m)| m.uid).collect();
+        assert_eq!(all, [5, 3, 2, 1]);
 
         // The tag query shares the row reader.
         let tagged = c.messages_with_keyword(1, "$label1");
-        assert_eq!(tagged.len(), 3);
-        assert_eq!(tagged[0].1.subject, "subject 3");
+        assert_eq!(tagged.len(), 5);
+        assert_eq!(tagged[0].1.subject, "subject 6");
         assert_eq!(tagged[0].1.keywords, ["$label1"]);
     }
 
