@@ -9281,7 +9281,8 @@ impl SimpleComponent for AppModel {
 
             AppMsg::PersonSelected(address) => {
                 self.close_sidebar_peek();
-                self.people_keep_count = !self.people.is_empty();
+                // A list from the cache at startup is not counted yet.
+                self.people_keep_count = self.people_counted_at.is_some();
                 self.open_people(address, &sender);
             }
 
@@ -11942,6 +11943,14 @@ impl AppModel {
                 }
             }
             self.folders.insert(account_id, folders);
+        }
+        // The People list as last counted, until the count behind it lands.
+        if self.show_people && !self.folders.is_empty() {
+            let people = cache.load_people();
+            if !people.is_empty() {
+                tracing::info!("people: {} people from the cache", people.len());
+                self.set_people(people);
+            }
         }
     }
 
@@ -18212,7 +18221,22 @@ impl AppModel {
     fn refresh_index_view(&mut self, sender: &ComponentSender<Self>) {
         let Some(key) = self.index_view.clone() else { return };
         let people_view = matches!(key, IndexView::People(_));
+        let scope = key.scope();
+        // A People view reads the accounts whose folders are known: from
+        // the cache at startup, before any worker has announced its account.
+        let mut accounts: Vec<u32> = if people_view {
+            self.folders.keys().copied().collect()
+        } else {
+            self.accounts.iter().map(|a| a.id).collect()
+        };
+        accounts.retain(|id| self.in_tag_scope(scope, *id));
+        accounts.sort_unstable();
         let mut count = people_view && !std::mem::take(&mut self.people_keep_count);
+        // Nothing to count yet: an empty count would only blank the list
+        // and hold the real one back by a recount pause.
+        if accounts.is_empty() && !(demo_mode() && self.config.is_empty()) {
+            count = false;
+        }
         // While a sync lands folder after folder, the list is counted at
         // most every PEOPLE_RECOUNT_PAUSE, and once more after the last.
         if count && self.people_counted_at.is_some_and(|t| t.elapsed() < PEOPLE_RECOUNT_PAUSE) {
@@ -18248,13 +18272,6 @@ impl AppModel {
             return;
         }
         self.index_view_loading = true;
-        let scope = key.scope();
-        let accounts: Vec<u32> = self
-            .accounts
-            .iter()
-            .map(|a| a.id)
-            .filter(|id| self.in_tag_scope(scope, *id))
-            .collect();
         let keywords = key.keywords(&self.tags);
         // What a People view reads: the user's addresses, and each
         // account's folders it keeps. A folder not listed (yet, or any
@@ -18275,7 +18292,8 @@ impl AppModel {
             let at = std::time::Instant::now();
             let mut rows: Vec<(u32, String, Message)> = Vec::new();
             let mut headers: Vec<crate::people::Header> = Vec::new();
-            if let Ok(cache) = crate::cache::Cache::open() {
+            let cache = crate::cache::Cache::open().ok();
+            if let Some(cache) = &cache {
                 for &account_id in &accounts {
                     let found = match (&key, &people_ctx) {
                         (IndexView::People(person), Some((own, kept))) => {
@@ -18314,6 +18332,9 @@ impl AppModel {
                     rows.len(),
                     at.elapsed().as_millis()
                 );
+                if let Some(cache) = &cache {
+                    cache.save_people(&people);
+                }
                 people
             });
             s.input(AppMsg::IndexViewLoaded { key, rows, people });

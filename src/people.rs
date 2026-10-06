@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 /// One person, as the People list shows them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Person {
     /// Lower-case address: the person's key.
     pub address: String,
