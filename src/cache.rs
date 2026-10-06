@@ -215,6 +215,14 @@ fn split_keywords(col: String) -> Vec<String> {
 /// Most messages one tag view lists per account; the list pages within it.
 const TAG_VIEW_LIMIT: i64 = 5000;
 
+/// The columns [`Cache::summaries`] reads a message summary from.
+fn summary_cols() -> String {
+    format!(
+        "folder_path, uid, from_name, from_addr, subject, date, ts, unread, starred, \
+         has_attachment, recipients, cc, message_id, references_, preview, reply_to, {KEYWORDS_COL}, importance, due"
+    )
+}
+
 /// Rowids written into a query as a literal list: they are integers, and a
 /// conversation can match more rows than a statement takes bound values.
 fn rowid_list(rowids: &[i64]) -> String {
@@ -2125,49 +2133,122 @@ impl Cache {
     pub fn messages_with_keyword(&self, account_id: u32, keyword: &str) -> Vec<(String, Message)> {
         let needle = format!(" {} ", keyword.to_ascii_lowercase());
         let sql = format!(
-            "SELECT folder_path, uid, from_name, from_addr, subject, date, ts, unread, starred, \
-                    has_attachment, recipients, cc, message_id, references_, preview, reply_to, {KEYWORDS_COL}, importance, due \
-             FROM messages \
+            "SELECT {cols} FROM messages \
              WHERE account_id = ?1 AND instr(' ' || lower({KEYWORDS_COL}) || ' ', ?2) > 0 \
-             ORDER BY ts DESC LIMIT ?3"
+             ORDER BY ts DESC LIMIT ?3",
+            cols = summary_cols()
         );
-        let run = || -> rusqlite::Result<Vec<(String, Message)>> {
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![account_id, needle, TAG_VIEW_LIMIT], |row| {
-                let uid: u32 = row.get(1)?;
-                let mut m = Message {
-                    id: uid,
-                    account_id,
-                    folder_id: 0, // filled in by the caller, which knows the ids
-                    uid,
-                    from_name: row.get(2)?,
-                    from_addr: row.get(3)?,
-                    reply_to: row.get(15)?,
-                    to: row.get(10)?,
-                    cc: row.get(11)?,
-                    subject: row.get(4)?,
-                    preview: row.get(14)?,
-                    body: String::new(),
-                    date: row.get(5)?,
-                    timestamp: row.get(6)?,
-                    unread: row.get(7)?,
-                    starred: row.get(8)?,
-                    keywords: split_keywords(row.get(16)?),
-                    has_attachment: row.get(9)?,
-                    message_id: row.get(12)?,
-                    references: row.get(13)?,
-                    importance: crate::models::Importance::from_i64(row.get(17)?),
-                    due: row.get(18)?,
-                };
-                m.scrub_nuls();
-                Ok((row.get::<_, String>(0)?, m))
+        self.summaries(&sql, params![account_id, needle, TAG_VIEW_LIMIT], account_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("cache messages_with_keyword failed: {e}");
+                Vec::new()
+            })
+    }
+
+    /// The header fields of every cached message of the account, with the
+    /// folder each sits in: what the People list (`crate::people`) is
+    /// counted from. Only the narrow columns are read, so it stays cheap on
+    /// a large mailbox.
+    pub fn people_headers(&self, account_id: u32) -> Vec<(String, crate::people::Header)> {
+        let run = || -> rusqlite::Result<Vec<(String, crate::people::Header)>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT folder_path, from_name, from_addr, recipients, cc, ts, unread, message_id \
+                 FROM messages WHERE account_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    crate::people::Header {
+                        from_name: row.get(1)?,
+                        from_addr: row.get(2)?,
+                        to: row.get(3)?,
+                        cc: row.get(4)?,
+                        timestamp: row.get(5)?,
+                        unread: row.get(6)?,
+                        message_id: row.get(7)?,
+                    },
+                ))
             })?;
             rows.collect()
         };
         run().unwrap_or_else(|e| {
-            tracing::warn!("cache messages_with_keyword failed: {e}");
+            tracing::warn!("cache people_headers failed: {e}");
             Vec::new()
         })
+    }
+
+    /// Cached messages of the account naming `address` (lower case) as
+    /// sender or recipient, newest first, with the folder each sits in. A
+    /// coarse match: the caller keeps the ones that belong to the person
+    /// (`crate::people::involves`).
+    pub fn messages_with_address(&self, account_id: u32, address: &str) -> Vec<(String, Message)> {
+        let sql = format!(
+            "SELECT {cols} FROM messages \
+             WHERE account_id = ?1 \
+               AND instr(lower(from_addr || ',' || recipients || ',' || cc), ?2) > 0 \
+             ORDER BY ts DESC LIMIT ?3",
+            cols = summary_cols()
+        );
+        self.summaries(&sql, params![account_id, address, TAG_VIEW_LIMIT], account_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("cache messages_with_address failed: {e}");
+                Vec::new()
+            })
+    }
+
+    /// The account's newest cached messages, any folder, with the folder
+    /// each sits in: All People reads these.
+    pub fn recent_messages(&self, account_id: u32) -> Vec<(String, Message)> {
+        let sql = format!(
+            "SELECT {cols} FROM messages WHERE account_id = ?1 ORDER BY ts DESC LIMIT ?2",
+            cols = summary_cols()
+        );
+        self.summaries(&sql, params![account_id, TAG_VIEW_LIMIT], account_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("cache recent_messages failed: {e}");
+                Vec::new()
+            })
+    }
+
+    /// Run a query selecting [`summary_cols`] into (folder path, message)
+    /// pairs. `folder_id` is left 0 for the caller, which knows the ids.
+    fn summaries(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+        account_id: u32,
+    ) -> rusqlite::Result<Vec<(String, Message)>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |row| {
+            let uid: u32 = row.get(1)?;
+            let mut m = Message {
+                id: uid,
+                account_id,
+                folder_id: 0,
+                uid,
+                from_name: row.get(2)?,
+                from_addr: row.get(3)?,
+                reply_to: row.get(15)?,
+                to: row.get(10)?,
+                cc: row.get(11)?,
+                subject: row.get(4)?,
+                preview: row.get(14)?,
+                body: String::new(),
+                date: row.get(5)?,
+                timestamp: row.get(6)?,
+                unread: row.get(7)?,
+                starred: row.get(8)?,
+                keywords: split_keywords(row.get(16)?),
+                has_attachment: row.get(9)?,
+                message_id: row.get(12)?,
+                references: row.get(13)?,
+                importance: crate::models::Importance::from_i64(row.get(17)?),
+                due: row.get(18)?,
+            };
+            m.scrub_nuls();
+            Ok((row.get::<_, String>(0)?, m))
+        })?;
+        rows.collect()
     }
 
     /// Gmail files one message under every label it carries, and moving it
@@ -2365,6 +2446,62 @@ mod tests {
 
         std::env::remove_var("XDG_DATA_HOME");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn summary(uid: u32, from: (&str, &str), to: &str, cc: &str, ts: i64) -> Message {
+        Message {
+            id: uid,
+            account_id: 1,
+            folder_id: 0,
+            uid,
+            from_name: from.0.into(),
+            from_addr: from.1.into(),
+            reply_to: String::new(),
+            to: to.into(),
+            cc: cc.into(),
+            subject: format!("subject {uid}"),
+            preview: String::new(),
+            body: String::new(),
+            date: String::new(),
+            timestamp: ts,
+            unread: true,
+            starred: false,
+            keywords: vec!["$label1".into()],
+            has_attachment: false,
+            message_id: format!("{uid}@example.com"),
+            references: String::new(),
+            importance: crate::models::Importance::default(),
+            due: 0,
+        }
+    }
+
+    #[test]
+    fn people_queries_read_headers_and_find_mail_by_address() {
+        let c = Cache::in_memory().unwrap();
+        c.save_messages(1, "INBOX", &[
+            summary(1, ("Ada", "Ada@x.com"), "me@example.com", "", 10),
+            summary(2, ("Bob", "bob@x.com"), "me@example.com", "ada@x.com", 20),
+        ]);
+        c.save_messages(1, "Sent", &[summary(3, ("Me", "me@example.com"), "Ada <ada@x.com>", "", 30)]);
+        c.save_messages(2, "INBOX", &[summary(4, ("Ada", "ada@x.com"), "other@example.com", "", 40)]);
+
+        let headers = c.people_headers(1);
+        assert_eq!(headers.len(), 3);
+        assert!(headers.iter().any(|(path, h)| path == "Sent" && h.to == "Ada <ada@x.com>"));
+
+        // Coarse: every mail of the account naming Ada, newest first, any
+        // folder; the Cc one is the caller's to drop (people::involves).
+        let uids: Vec<u32> = c.messages_with_address(1, "ada@x.com").iter().map(|(_, m)| m.uid).collect();
+        assert_eq!(uids, [3, 2, 1]);
+        assert!(c.messages_with_address(1, "carol@x.com").is_empty());
+        let recent: Vec<u32> = c.recent_messages(1).iter().map(|(_, m)| m.uid).collect();
+        assert_eq!(recent, [3, 2, 1]);
+
+        // The tag query shares the row reader.
+        let tagged = c.messages_with_keyword(1, "$label1");
+        assert_eq!(tagged.len(), 3);
+        assert_eq!(tagged[0].1.subject, "subject 3");
+        assert_eq!(tagged[0].1.keywords, ["$label1"]);
     }
 
     #[test]

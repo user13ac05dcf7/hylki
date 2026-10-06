@@ -251,6 +251,7 @@ use crate::ui::preferences::{PrefInit, PrefInput, PrefOutput, Preferences};
 use crate::ui::sidebar::{
     CtxAction, SectionData, Sidebar, SidebarInit, SidebarInput, SidebarOutput, UnifiedFolderRef,
 };
+use crate::ui::people_pane::{PeoplePane, PeoplePaneInput, PeoplePaneOutput};
 use crate::worker::{self, MailRequest, OutgoingMessage, WorkerEvent};
 use crate::i18n::{i18n, i18n_f, i18n_noop, ni18n_f};
 
@@ -425,6 +426,28 @@ impl HandOffFiles {
             Self { attach: Vec::new(), cloud: files }
         } else {
             Self { attach: files, cloud: Vec::new() }
+        }
+    }
+}
+
+/// A message list read from the on-disk index rather than from one folder.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IndexView {
+    /// A tag view (#71): the account it is scoped to (`None` spans every
+    /// account) and the keyword (`None` for every tag at once).
+    Tag(Option<u32>, Option<String>),
+    /// The People view: the mail exchanged with one person (lower-case
+    /// address) across every account in the unified section, or with
+    /// everyone (`None`, All People).
+    People(Option<String>),
+}
+
+impl IndexView {
+    /// The account a view is scoped to; `None` spans the unified section.
+    fn scope(&self) -> Option<u32> {
+        match self {
+            IndexView::Tag(scope, _) => *scope,
+            IndexView::People(_) => None,
         }
     }
 }
@@ -752,6 +775,23 @@ pub struct AppModel {
     show_attachments: bool,
     /// Whether the sidebar's footer shows the "Contacts" shortcut row.
     show_contacts: bool,
+    /// Whether the sidebar shows the People pane instead of the folders.
+    show_people: bool,
+    /// The People pane, one per sidebar (docked, and the peek panel's),
+    /// each in a stack with its sidebar; the header buttons switching them.
+    people_pane: Controller<PeoplePane>,
+    peek_people: Controller<PeoplePane>,
+    sidebar_stack: gtk::Stack,
+    peek_stack: gtk::Stack,
+    people_toggles: Vec<gtk::ToggleButton>,
+    /// The People pane is on at launch: the sidebar's first pick (All
+    /// Inboxes, or the launch folder) opens All People instead.
+    people_boot: bool,
+    /// A message to open once the People view it is in has loaded (a
+    /// notification clicked with the People pane on): account, message id.
+    people_open: Option<(u32, u32)>,
+    /// The People list last read, for adjusting its unread counts.
+    people: Vec<crate::people::Person>,
     /// Whether the settings window opens on Accounts (vs Preferences).
     settings_open_accounts: bool,
     /// The Settings category last shown this session, to reopen on.
@@ -888,18 +928,17 @@ pub struct AppModel {
     filters: Vec<config::FilterRule>,
     /// Tags (#71): a name and color per keyword.
     tags: Vec<config::Tag>,
-    /// The tag view, if that is the view — alongside `unified` and
-    /// `selected`, never with: the account it is scoped to (`None` spans
-    /// every account) and the keyword (`None` for every tag at once).
-    tag_view: Option<(Option<u32>, Option<String>)>,
-    /// Each tag view's last result, by (scope, keyword): shown the moment
-    /// the view opens, while a fresh read of the index runs off the main
-    /// thread and replaces it only if it differs.
-    tag_view_cache: HashMap<(Option<u32>, Option<String>), Vec<Message>>,
-    /// A read of the index for the open tag view is in flight; one more
-    /// asked for meanwhile runs when it lands.
-    tag_view_loading: bool,
-    tag_view_dirty: bool,
+    /// The tag or People view, if that is the view — alongside `unified`
+    /// and `selected`, never with.
+    index_view: Option<IndexView>,
+    /// Each index view's last result: shown the moment the view opens,
+    /// while a fresh read of the index runs off the main thread and
+    /// replaces it only if it differs.
+    index_view_cache: HashMap<IndexView, Vec<Message>>,
+    /// A read of the index for the open view is in flight; one more asked
+    /// for meanwhile runs when it lands.
+    index_view_loading: bool,
+    index_view_dirty: bool,
     /// When each account's keywords were last re-synced from the server
     /// (#166), so reopening a tag view within a few seconds does not scan
     /// every folder again.
@@ -1482,9 +1521,14 @@ pub enum AppMsg {
         drafts: bool,
         archive: bool,
     },
-    /// A tag view's rows, read from the index off the main thread: the
-    /// view they answer and, per message, its account and folder path.
-    TagViewLoaded { key: (Option<u32>, Option<String>), rows: Vec<(u32, String, Message)> },
+    /// An index view's rows, read off the main thread: the view they
+    /// answer and, per message, its account and folder path. A People view
+    /// brings the People list along.
+    IndexViewLoaded {
+        key: IndexView,
+        rows: Vec<(u32, String, Message)>,
+        people: Option<Vec<crate::people::Person>>,
+    },
     /// The cursor entered the sidebar pane — open the hover peek (rail +
     /// preference permitting).
     SidebarHoverEnter,
@@ -1694,6 +1738,11 @@ pub enum AppMsg {
     /// every tag at once), and the account it is scoped to (an account
     /// section's own Tags row) or `None` for every account.
     TagSelected { keyword: Option<String>, account: Option<u32> },
+    /// The sidebar's People button: show the People pane (and All People)
+    /// or the folders again.
+    SetPeopleMode(bool),
+    /// A person was picked in the People pane (`None`: All People).
+    PersonSelected(Option<String>),
     /// Put a tag on one message, or take it off (row menu, palette, card).
     SetTag { message: Box<Message>, keyword: String, add: bool },
     /// Put a tag on several messages, or take it off (the list's bulk bar).
@@ -1926,9 +1975,9 @@ impl SimpleComponent for AppModel {
                                 add_css_class: "flat",
                                 set_menu_model: Some(&model.menu),
                             },
+                            pack_end: &model.people_toggles[1],
                         },
-                        #[wrap(Some)]
-                        set_content = model.peek_sidebar.widget(),
+                        set_content: Some(&model.peek_stack),
                     },
 
                     #[wrap(Some)]
@@ -1960,9 +2009,9 @@ impl SimpleComponent for AppModel {
                                 add_css_class: "flat",
                                 set_menu_model: Some(&model.menu),
                             },
+                            pack_end: &model.people_toggles[0],
                         },
-                        #[wrap(Some)]
-                        set_content = model.sidebar.widget(),
+                        set_content: Some(&model.sidebar_stack),
                     },
 
                     #[wrap(Some)]
@@ -2810,6 +2859,44 @@ impl SimpleComponent for AppModel {
             })
             .forward(sender.input_sender(), sidebar_output_msg);
 
+        // The People pane, in a stack with each sidebar, and the header
+        // buttons switching between the two.
+        let show_people = prefs.show_people;
+        let people_msg = |out| match out {
+            PeoplePaneOutput::Selected(address) => AppMsg::PersonSelected(address),
+            PeoplePaneOutput::Compose(address) => AppMsg::ComposeTo(address),
+        };
+        let people_pane = PeoplePane::builder().launch(()).forward(sender.input_sender(), people_msg);
+        let peek_people = PeoplePane::builder().launch(()).forward(sender.input_sender(), people_msg);
+        let stack_of = |sidebar: &gtk::Widget, people: &gtk::Widget| {
+            let stack = gtk::Stack::new();
+            stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+            stack.add_named(sidebar, Some("folders"));
+            stack.add_named(people, Some("people"));
+            stack
+        };
+        let sidebar_stack = stack_of(sidebar.widget().upcast_ref(), people_pane.widget().upcast_ref());
+        let peek_stack = stack_of(peek_sidebar.widget().upcast_ref(), peek_people.widget().upcast_ref());
+        let people_toggles: Vec<gtk::ToggleButton> = (0..2)
+            .map(|_| {
+                let b = gtk::ToggleButton::new();
+                b.set_icon_name("system-users-symbolic");
+                b.set_tooltip_text(Some(i18n("People").as_str()));
+                b.add_css_class("flat");
+                b.set_valign(gtk::Align::Center);
+                b.set_active(show_people);
+                let s = sender.input_sender().clone();
+                b.connect_toggled(move |b| {
+                    let _ = s.send(AppMsg::SetPeopleMode(b.is_active()));
+                });
+                b
+            })
+            .collect();
+        if show_people {
+            sidebar_stack.set_visible_child_name("people");
+            peek_stack.set_visible_child_name("people");
+        }
+
         let message_list =
             MessageList::builder()
                 .launch(())
@@ -3275,6 +3362,15 @@ impl SimpleComponent for AppModel {
             notification_buttons: config::load_notification_buttons(),
             show_attachments,
             show_contacts,
+            show_people,
+            people_pane,
+            peek_people,
+            sidebar_stack,
+            peek_stack,
+            people_toggles,
+            people_boot: show_people,
+            people_open: None,
+            people: Vec::new(),
             settings_open_accounts: prefs.settings_open_accounts,
             last_settings_page: None,
             list_count: String::new(),
@@ -3343,10 +3439,10 @@ impl SimpleComponent for AppModel {
                 let tags = config::load_tags();
                 if tags.is_empty() && demo_data { demo_tags() } else { tags }
             },
-            tag_view: None,
-            tag_view_cache: HashMap::new(),
-            tag_view_loading: false,
-            tag_view_dirty: false,
+            index_view: None,
+            index_view_cache: HashMap::new(),
+            index_view_loading: false,
+            index_view_dirty: false,
             keyword_sync_at: HashMap::new(),
             tag_provider: crate::ui::DisplayCss::new(),
             // Demo mode gets a cache that never touches disk, seeded with the
@@ -4831,6 +4927,19 @@ impl SimpleComponent for AppModel {
                         let _ = sb.send(SidebarInput::ToggleCollapsed);
                     });
                 }
+                // HYLKI_SHOWCASE_PEOPLE=all|<address> turns the People pane
+                // on at 3s and, given an address, opens that person at 5s.
+                if let Ok(who) = std::env::var("HYLKI_SHOWCASE_PEOPLE") {
+                    let s = sender.clone();
+                    gtk::glib::timeout_add_seconds_local_once(3, move || {
+                        s.input(AppMsg::SetPeopleMode(true));
+                        if who != "all" {
+                            gtk::glib::timeout_add_seconds_local_once(2, move || {
+                                s.input(AppMsg::PersonSelected(Some(who.to_lowercase())));
+                            });
+                        }
+                    });
+                }
                 // HYLKI_SHOWCASE_PEEK=<seconds>[,<seconds>…] works the header's
                 // sidebar toggle at each of those moments (1 or anything
                 // unparseable means 8 s), with the window raised first so the
@@ -5458,7 +5567,7 @@ impl SimpleComponent for AppModel {
                 self.leave_gallery();
                 self.showing_contacts = false;
                 self.unified = false;
-                self.tag_view = None;
+                self.index_view = None;
                 self.selected = None;
                 self.current = None;
                 self.current_thread.clear();
@@ -5629,10 +5738,20 @@ impl SimpleComponent for AppModel {
             }
 
             AppMsg::UnifiedSelected(view) => {
+                // With the People pane on at launch, the sidebar's first
+                // pick opens All People instead.
+                if self.people_boot {
+                    self.open_people(None, &sender);
+                    return;
+                }
                 self.open_unified(view);
             }
 
             AppMsg::FolderSelected { account_id, folder_id, name, path } => {
+                if self.people_boot {
+                    self.open_people(None, &sender);
+                    return;
+                }
                 self.close_sidebar_peek();
                 self.select_folder(account_id, folder_id, name, path);
             }
@@ -5686,6 +5805,22 @@ impl SimpleComponent for AppModel {
                     // unfolds the account to show where that is. Both emit
                     // the (cached) list synchronously, so the SelectAndLoad
                     // that follows finds the row and opens it.
+                    // With the People pane on, the sender's conversation
+                    // opens there, once its view has been read.
+                    let person = self
+                        .message_cache
+                        .get(&(account_id, folder_id))
+                        .and_then(|msgs| msgs.iter().find(|m| m.id == message_id))
+                        .and_then(|m| {
+                            let h = crate::people::Header::from(m);
+                            crate::people::counterparts(&h, &self.own_addresses()).into_iter().next()
+                        })
+                        .map(|(address, _)| address);
+                    if self.show_people && self.in_unified(account_id) && person.is_some() {
+                        self.people_open = Some((account_id, message_id));
+                        self.open_people(person, &sender);
+                        return;
+                    }
                     if kind == FolderKind::Inbox
                         && self.unified_inboxes_shown()
                         && self.in_unified(account_id)
@@ -9061,7 +9196,7 @@ impl SimpleComponent for AppModel {
                 self.tags = tags;
                 // The unified Tags view spans every tag: what it holds is
                 // stale once the set changes.
-                self.tag_view_cache.retain(|(_, kw), _| kw.is_some());
+                self.index_view_cache.retain(|k, _| !matches!(k, IndexView::Tag(_, None)));
                 self.refresh_tag_css();
                 self.message_list.emit(MessageListInput::SetTags(self.tags.clone()));
                 self.message_view.emit(MessageViewInput::SetTags(self.tags.clone()));
@@ -9082,30 +9217,31 @@ impl SimpleComponent for AppModel {
                     Some(k) => crate::ui::sidebar::Sel::Tag(account, k),
                     None => crate::ui::sidebar::Sel::UnifiedTags,
                 });
-                self.leave_gallery();
-                self.showing_contacts = false;
-                self.showing_outbox = false;
-                self.unified = false;
-                self.selected = None;
-                self.tag_view = Some((account, keyword));
-                self.current = None;
-                self.current_thread.clear();
-                self.attachments.clear();
-                self.attachments_loading = false;
-                self.sync_attachment_drawer();
-                self.show_message(None, false);
-                self.message_list.emit(MessageListInput::SetSelected(None));
-                self.message_list.emit(MessageListInput::SetColorize(true));
-                self.message_list.emit(MessageListInput::ResetPaging);
-                self.message_list.emit(MessageListInput::SetShowRecipient(false));
-                self.message_list.emit(MessageListInput::SetRestorable(false));
-                self.message_list.emit(MessageListInput::SetInJunk(false));
-                self.message_list.emit(MessageListInput::SetInDrafts(false));
-                self.message_view.emit(MessageViewInput::SetDraftsView(false));
-                self.show_tag_view();
-                self.refresh_tag_view(&sender);
+                self.open_index_view(IndexView::Tag(account, keyword), &sender);
                 self.sync_tag_keywords();
-                self.push_index_complete();
+            }
+
+            AppMsg::SetPeopleMode(on) => {
+                if on == self.show_people {
+                    return;
+                }
+                self.set_people_pane(on);
+                if on {
+                    self.open_people(None, &sender);
+                } else if self.unified_inboxes_shown() {
+                    self.sidebars_emit(SidebarInput::SelectUnifiedRow);
+                } else if let Some((account_id, f)) = self.first_inbox() {
+                    self.sidebars_emit(SidebarInput::SelectFolderRow {
+                        account_id,
+                        path: f.path.clone(),
+                    });
+                    self.select_folder(account_id, f.id, f.name, f.path);
+                }
+            }
+
+            AppMsg::PersonSelected(address) => {
+                self.close_sidebar_peek();
+                self.open_people(address, &sender);
             }
 
             AppMsg::KeywordsSynced { account_id, paths } => {
@@ -9115,8 +9251,8 @@ impl SimpleComponent for AppModel {
                 // The index changed under the open views: the tag view
                 // re-reads it, and an open folder among the changed ones
                 // re-syncs so its rows' chips follow.
-                if self.tag_view.is_some() {
-                    self.refresh_tag_view(&sender);
+                if self.index_view.is_some() {
+                    self.refresh_index_view(&sender);
                 }
                 if let Some(sel) = self.selected.clone() {
                     if sel.account_id == account_id && paths.contains(&sel.path) {
@@ -9128,18 +9264,24 @@ impl SimpleComponent for AppModel {
                 }
             }
 
-            AppMsg::TagViewLoaded { key, rows } => {
-                self.tag_view_loading = false;
-                let out = self.assemble_tag_view(&key, rows);
-                let changed = self.tag_view_cache.get(&key) != Some(&out);
+            AppMsg::IndexViewLoaded { key, rows, people } => {
+                self.index_view_loading = false;
+                if let Some(people) = people {
+                    self.set_people(people);
+                }
+                let out = self.assemble_index_view(&key, rows);
+                let changed = self.index_view_cache.get(&key) != Some(&out);
                 if changed {
-                    self.tag_view_cache.insert(key.clone(), out.clone());
+                    self.index_view_cache.insert(key.clone(), out.clone());
                 }
-                if self.tag_view.as_ref() == Some(&key) && changed {
-                    self.message_list.emit(MessageListInput::SetMessages { messages: out });
+                if self.index_view.as_ref() == Some(&key) {
+                    if changed {
+                        self.message_list.emit(MessageListInput::SetMessages { messages: out });
+                    }
+                    self.open_pending_people_mail();
                 }
-                if std::mem::take(&mut self.tag_view_dirty) {
-                    self.refresh_tag_view(&sender);
+                if std::mem::take(&mut self.index_view_dirty) {
+                    self.refresh_index_view(&sender);
                 }
             }
 
@@ -10267,10 +10409,10 @@ impl SimpleComponent for AppModel {
                         self.message_list
                             .emit(MessageListInput::SetMessages { messages });
                     }
-                } else if self.tag_view.is_some() {
+                } else if self.index_view.is_some() {
                     // The index just took this folder's flags: re-read the
                     // tag, off the main thread.
-                    self.refresh_tag_view(&sender);
+                    self.refresh_index_view(&sender);
                 }
                 // The reader's message was removed by this sync (deleted/moved on
                 // another device). Clear it right away so nothing stale lingers, then
@@ -11014,10 +11156,10 @@ impl AppModel {
             human_count(self.unified_slices.len()),
             count(unified)
         ));
-        let tags = messages_bytes(self.tag_view_cache.values().flatten());
+        let tags = messages_bytes(self.index_view_cache.values().flatten());
         out.push_str(&format!(
-            "  tag views ({}): {}\n",
-            human_count(self.tag_view_cache.len()),
+            "  tag and People views ({}): {}\n",
+            human_count(self.index_view_cache.len()),
             count(tags)
         ));
         let [all, shown, pool] = self.message_list.model().memory_stats();
@@ -11212,6 +11354,7 @@ impl AppModel {
             notification_buttons: self.notification_buttons.to_list(),
             show_attachments: self.show_attachments,
             show_contacts: self.show_contacts,
+            show_people: self.show_people,
             settings_open_accounts: self.settings_open_accounts,
             card_actions_hover: self.card_actions_hover,
             card_actions_auto: self.card_actions_auto,
@@ -11795,7 +11938,7 @@ impl AppModel {
         self.folders.clear();
         self.selected = None;
         self.unified = false;
-        self.tag_view = None;
+        self.index_view = None;
         self.unified_slices.clear();
         self.message_cache.clear();
         self.body_cache.clear();
@@ -12925,7 +13068,12 @@ impl AppModel {
     /// Highlight what the app now shows in both sidebar instances. The one
     /// the user clicked already has it (its guard makes this a no-op), the
     /// other follows; neither reports back.
-    fn mirror_selection(&self, sel: crate::ui::sidebar::Sel) {
+    /// Any view but People's puts the folders back in place of the People
+    /// pane.
+    fn mirror_selection(&mut self, sel: crate::ui::sidebar::Sel) {
+        if self.show_people && sel != crate::ui::sidebar::Sel::People {
+            self.set_people_pane(false);
+        }
         self.sidebars_emit(SidebarInput::MirrorSelection(sel));
     }
 
@@ -14120,9 +14268,9 @@ impl AppModel {
     /// went with the change (one account or none left in the section), the
     /// sidebar has already moved to the first inbox instead.
     fn reload_unified_views(&mut self, open: Option<UnifiedView>, sender: &ComponentSender<Self>) {
-        self.tag_view_cache.retain(|(scope, _), _| scope.is_some());
-        if self.tag_view.as_ref().is_some_and(|(scope, _)| scope.is_none()) {
-            self.refresh_tag_view(sender);
+        self.index_view_cache.retain(|k, _| k.scope().is_some());
+        if self.index_view.as_ref().is_some_and(|k| k.scope().is_none()) {
+            self.refresh_index_view(sender);
         }
         let Some(view) = open else { return };
         let listed = match view {
@@ -14163,7 +14311,7 @@ impl AppModel {
         }
         self.unified_view = view;
         self.unified = true;
-        self.tag_view = None;
+        self.index_view = None;
         self.selected = None;
         if self.seen_counts {
             self.push_unread_counts();
@@ -14471,7 +14619,7 @@ impl AppModel {
             path: path.clone(),
         });
         self.unified = false;
-        self.tag_view = None;
+        self.index_view = None;
         self.attachments.clear();
         self.sync_attachment_drawer();
         self.attachments_loading = false;
@@ -17875,7 +18023,7 @@ impl AppModel {
     /// refresh right after opening one, must not walk every folder twice.
     fn sync_tag_keywords(&mut self) {
         const PAUSE: std::time::Duration = std::time::Duration::from_secs(15);
-        let Some((scope, _)) = self.tag_view.clone() else { return };
+        let Some(IndexView::Tag(scope, _)) = self.index_view.clone() else { return };
         let keywords: Vec<String> = self.tags.iter().map(|t| t.keyword.clone()).collect();
         if keywords.is_empty() {
             return;
@@ -17902,19 +18050,114 @@ impl AppModel {
         scope.map_or_else(|| self.in_unified(account_id), |id| id == account_id)
     }
 
-    fn tag_view_keywords(&self, kw: &Option<String>) -> Vec<String> {
+    fn index_view_keywords(&self, kw: &Option<String>) -> Vec<String> {
         match kw {
             Some(k) => vec![k.clone()],
             None => self.tags.iter().map(|t| t.keyword.clone()).collect(),
         }
     }
 
+    /// Open an index view (a tag, or the People view) in the message list:
+    /// its last result at once, a fresh read of the index behind.
+    fn open_index_view(&mut self, view: IndexView, sender: &ComponentSender<Self>) {
+        self.leave_gallery();
+        self.showing_contacts = false;
+        self.showing_outbox = false;
+        self.unified = false;
+        self.selected = None;
+        self.index_view = Some(view);
+        self.current = None;
+        self.current_thread.clear();
+        self.attachments.clear();
+        self.attachments_loading = false;
+        self.sync_attachment_drawer();
+        self.show_message(None, false);
+        self.message_list.emit(MessageListInput::SetSelected(None));
+        self.message_list.emit(MessageListInput::SetColorize(true));
+        self.message_list.emit(MessageListInput::ResetPaging);
+        self.message_list.emit(MessageListInput::SetShowRecipient(false));
+        self.message_list.emit(MessageListInput::SetRestorable(false));
+        self.message_list.emit(MessageListInput::SetInJunk(false));
+        self.message_list.emit(MessageListInput::SetInDrafts(false));
+        self.message_view.emit(MessageViewInput::SetDraftsView(false));
+        self.show_index_view();
+        self.refresh_index_view(sender);
+        self.push_index_complete();
+    }
+
+    /// Open the People view on a person (`None`: All People), with the
+    /// People pane showing.
+    fn open_people(&mut self, address: Option<String>, sender: &ComponentSender<Self>) {
+        self.people_boot = false;
+        self.set_people_pane(true);
+        self.sidebars_emit(SidebarInput::MirrorSelection(crate::ui::sidebar::Sel::People));
+        self.people_pane.emit(PeoplePaneInput::Select(address.clone()));
+        self.peek_people.emit(PeoplePaneInput::Select(address.clone()));
+        self.open_index_view(IndexView::People(address), sender);
+    }
+
+    /// Show the People pane in place of the folders, or the folders again,
+    /// remembering the choice.
+    fn set_people_pane(&mut self, on: bool) {
+        let page = if on { "people" } else { "folders" };
+        self.sidebar_stack.set_visible_child_name(page);
+        self.peek_stack.set_visible_child_name(page);
+        for b in &self.people_toggles {
+            if b.is_active() != on {
+                b.set_active(on);
+            }
+        }
+        if !on && matches!(self.index_view, Some(IndexView::People(_))) {
+            self.index_view = None;
+        }
+        pref!(self.show_people = on);
+    }
+
+    /// Open the notified message the People view was opened for, now that
+    /// its list holds it.
+    fn open_pending_people_mail(&mut self) {
+        if matches!(self.index_view, Some(IndexView::People(_))) {
+            if let Some(target) = self.people_open.take() {
+                self.message_list.emit(MessageListInput::SelectAndLoad(target));
+            }
+        }
+    }
+
+    /// Hand both People panes the People list.
+    fn set_people(&mut self, people: Vec<crate::people::Person>) {
+        self.peek_people.emit(PeoplePaneInput::SetPeople(people.clone()));
+        self.people_pane.emit(PeoplePaneInput::SetPeople(people.clone()));
+        self.people = people;
+    }
+
+    /// A message was marked read or unread: its sender's unread count in
+    /// the People list follows at once, without reading the index again.
+    fn adjust_people_unread(&mut self, m: &Message, read: bool) {
+        if self.people.is_empty() || self.own_addresses().contains(&m.from_addr) {
+            return;
+        }
+        let address = m.from_addr.trim().to_lowercase();
+        let Some(p) = self.people.iter_mut().find(|p| p.address == address) else { return };
+        p.unread = if read { p.unread.saturating_sub(1) } else { p.unread + 1 };
+        let people = self.people.clone();
+        self.set_people(people);
+    }
+
+    /// The first account's inbox: where leaving the People view lands when
+    /// there is no All Inboxes row.
+    fn first_inbox(&self) -> Option<(u32, Folder)> {
+        self.accounts.iter().find_map(|a| {
+            let f = self.folders.get(&a.id)?.iter().find(|f| f.kind == FolderKind::Inbox)?;
+            Some((a.id, f.clone()))
+        })
+    }
+
     /// Show the open tag view from its last result at once (an empty
-    /// loading list if it never ran); [`refresh_tag_view`] brings it up to
+    /// loading list if it never ran); [`refresh_index_view`] brings it up to
     /// date behind.
-    fn show_tag_view(&self) {
-        let Some(key) = self.tag_view.as_ref() else { return };
-        match self.tag_view_cache.get(key) {
+    fn show_index_view(&self) {
+        let Some(key) = self.index_view.as_ref() else { return };
+        match self.index_view_cache.get(key) {
             Some(cached) => {
                 self.message_list.emit(MessageListInput::SetMessages { messages: cached.clone() })
             }
@@ -17922,68 +18165,138 @@ impl AppModel {
         }
     }
 
-    /// Read the open tag view's rows from the on-disk index off the main
+    /// Read the open index view's rows from the on-disk index off the main
     /// thread (reading tens of thousands of rows per account is what made
-    /// a tag click pause), answering with [`AppMsg::TagViewLoaded`]. The
-    /// demo's mail never reaches the database, so its view is assembled
-    /// here from the folders loaded so far.
-    fn refresh_tag_view(&mut self, sender: &ComponentSender<Self>) {
-        let Some(key) = self.tag_view.clone() else { return };
+    /// a tag click pause), answering with [`AppMsg::IndexViewLoaded`]. A
+    /// People view also counts the People list there. The demo's mail
+    /// never reaches the database, so its view is assembled here from the
+    /// folders loaded so far.
+    fn refresh_index_view(&mut self, sender: &ComponentSender<Self>) {
+        let Some(key) = self.index_view.clone() else { return };
         if demo_mode() && self.config.is_empty() {
-            let out = self.assemble_tag_view(&key, Vec::new());
-            self.tag_view_cache.insert(key, out.clone());
+            if matches!(key, IndexView::People(_)) {
+                let headers: Vec<crate::people::Header> = self
+                    .message_cache
+                    .iter()
+                    .filter(|((a, f), _)| self.in_people_scope(*a, self.folder_kind(*a, *f)))
+                    .flat_map(|(_, msgs)| msgs.iter().map(crate::people::Header::from))
+                    .collect();
+                self.set_people(crate::people::people(&headers, &self.own_addresses()));
+            }
+            let out = self.assemble_index_view(&key, Vec::new());
+            self.index_view_cache.insert(key, out.clone());
             self.message_list.emit(MessageListInput::SetMessages { messages: out });
+            self.open_pending_people_mail();
             return;
         }
-        if self.tag_view_loading {
-            self.tag_view_dirty = true;
+        if self.index_view_loading {
+            self.index_view_dirty = true;
             return;
         }
-        self.tag_view_loading = true;
-        let (scope, kw) = key.clone();
-        let keywords = self.tag_view_keywords(&kw);
+        self.index_view_loading = true;
+        let scope = key.scope();
         let accounts: Vec<u32> = self
             .accounts
             .iter()
             .map(|a| a.id)
             .filter(|id| self.in_tag_scope(scope, *id))
             .collect();
+        let keywords = match &key {
+            IndexView::Tag(_, kw) => self.index_view_keywords(kw),
+            IndexView::People(_) => Vec::new(),
+        };
+        // The folders the People list leaves out, by account and path.
+        let skipped: std::collections::HashSet<(u32, String)> = self
+            .folders
+            .iter()
+            .flat_map(|(a, fs)| fs.iter().map(move |f| (*a, f)))
+            .filter(|(a, f)| !self.in_people_scope(*a, Some(f.kind)))
+            .map(|(a, f)| (a, f.path.clone()))
+            .collect();
+        let own = self.own_addresses();
         let s = sender.clone();
         std::thread::spawn(move || {
+            let at = std::time::Instant::now();
             let mut rows: Vec<(u32, String, Message)> = Vec::new();
+            let mut people = None;
             if let Ok(cache) = crate::cache::Cache::open() {
-                for account_id in accounts {
-                    for kw in &keywords {
-                        for (path, m) in cache.messages_with_keyword(account_id, kw) {
-                            rows.push((account_id, path, m));
-                        }
+                for &account_id in &accounts {
+                    let found = match &key {
+                        IndexView::Tag(..) => keywords
+                            .iter()
+                            .flat_map(|kw| cache.messages_with_keyword(account_id, kw))
+                            .collect(),
+                        IndexView::People(Some(address)) => cache.messages_with_address(account_id, address),
+                        IndexView::People(None) => cache.recent_messages(account_id),
+                    };
+                    rows.extend(found.into_iter().map(|(path, m)| (account_id, path, m)));
+                }
+                if matches!(key, IndexView::People(_)) {
+                    let mut headers: Vec<crate::people::Header> = Vec::new();
+                    for &account_id in &accounts {
+                        headers.extend(
+                            cache
+                                .people_headers(account_id)
+                                .into_iter()
+                                .filter(|(path, _)| !skipped.contains(&(account_id, path.clone())))
+                                .map(|(_, h)| h),
+                        );
                     }
+                    people = Some(crate::people::people(&headers, &own));
                 }
             }
-            s.input(AppMsg::TagViewLoaded { key, rows });
+            if let Some(p) = &people {
+                tracing::info!(
+                    "people: {} people, {} rows in {} ms",
+                    p.len(),
+                    rows.len(),
+                    at.elapsed().as_millis()
+                );
+            }
+            s.input(AppMsg::IndexViewLoaded { key, rows, people });
         });
     }
 
-    /// The tag view (#71) from its rows: every message of every account in
-    /// scope carrying the tag, newest first. Trash and Junk keep their tags
-    /// but stay out; Gmail's per-label copies of one message collapse to one
-    /// row, the inbox copy where there is one (its actions land where
-    /// expected).
-    fn assemble_tag_view(
-        &self,
-        key: &(Option<u32>, Option<String>),
-        rows: Vec<(u32, String, Message)>,
-    ) -> Vec<Message> {
-        let (scope, kw) = key;
-        let in_scope = |account_id: u32| self.in_tag_scope(*scope, account_id);
-        let keywords = self.tag_view_keywords(kw);
+    /// An index view from its rows, newest first. A tag view (#71) holds
+    /// every message of every account in scope carrying the tag; Trash and
+    /// Junk keep their tags but stay out. A People view holds the mail
+    /// exchanged with the person (with anyone, for All People) and leaves
+    /// Drafts out as well. Gmail's per-label copies of one message collapse
+    /// to one row, the inbox copy where there is one (its actions land
+    /// where expected).
+    fn assemble_index_view(&self, key: &IndexView, rows: Vec<(u32, String, Message)>) -> Vec<Message> {
+        let scope = key.scope();
+        let own = self.own_addresses();
+        let keywords = match key {
+            IndexView::Tag(_, kw) => self.index_view_keywords(kw),
+            IndexView::People(_) => Vec::new(),
+        };
+        let keep_kind = |account_id: u32, kind: Option<FolderKind>| match key {
+            IndexView::Tag(..) => !matches!(kind, Some(FolderKind::Trash | FolderKind::Junk)),
+            IndexView::People(_) => self.in_people_scope(account_id, kind),
+        };
+        let belongs = |m: &Message| match key {
+            IndexView::Tag(..) => keywords.iter().any(|k| m.has_keyword(k)),
+            IndexView::People(person) => {
+                let h = crate::people::Header::from(m);
+                match person {
+                    Some(address) => crate::people::involves(&h, &own, address),
+                    None => !crate::people::counterparts(&h, &own).is_empty(),
+                }
+            }
+        };
         let mut out: Vec<Message> = Vec::new();
         let mut seen_rows: std::collections::HashSet<(u32, u32, u32)> =
             std::collections::HashSet::new();
         for (account_id, path, mut m) in rows {
             let Some(folders) = self.folders.get(&account_id) else { continue };
             let Some(f) = folders.iter().find(|f| f.path == path) else { continue };
-            if matches!(f.kind, FolderKind::Trash | FolderKind::Junk) {
+            if !keep_kind(account_id, Some(f.kind)) {
+                continue;
+            }
+            // The index matched an address anywhere in the headers: keep
+            // the mail that is the person's own (not a Cc on another's).
+            if matches!(key, IndexView::People(_)) && !belongs(&m) {
                 continue;
             }
             m.folder_id = f.id;
@@ -17992,24 +18305,16 @@ impl AppModel {
                 out.push(m);
             }
         }
-        // The demo's mail never reaches the database, so its tag view reads
-        // the folders loaded so far instead.
+        // The demo's mail never reaches the database, so its view reads the
+        // folders loaded so far instead.
         if out.is_empty() && demo_mode() && self.config.is_empty() {
             for ((account_id, folder_id), messages) in &self.message_cache {
-                if !in_scope(*account_id)
-                    || matches!(
-                        self.folder_kind(*account_id, *folder_id),
-                        Some(FolderKind::Trash | FolderKind::Junk)
-                    )
+                if !self.in_tag_scope(scope, *account_id)
+                    || !keep_kind(*account_id, self.folder_kind(*account_id, *folder_id))
                 {
                     continue;
                 }
-                out.extend(
-                    messages
-                        .iter()
-                        .filter(|m| keywords.iter().any(|k| m.has_keyword(k)))
-                        .cloned(),
-                );
+                out.extend(messages.iter().filter(|m| belongs(m)).cloned());
             }
         }
         let inbox_first = |m: &Message| {
@@ -18021,6 +18326,22 @@ impl AppModel {
         let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
         out.retain(|m| m.message_id.is_empty() || seen.insert((m.account_id, m.message_id.clone())));
         out
+    }
+
+    /// Whether the People view reads a folder: one of an account in the
+    /// unified section, and not Trash, Junk or Drafts (a folder not known
+    /// yet counts).
+    fn in_people_scope(&self, account_id: u32, kind: Option<FolderKind>) -> bool {
+        self.in_unified(account_id)
+            && !matches!(kind, Some(FolderKind::Trash | FolderKind::Junk | FolderKind::Drafts))
+    }
+
+    /// The user's own addresses (every account's and its send-as
+    /// aliases'), which never make a person in the People view.
+    fn own_addresses(&self) -> crate::people::Own {
+        crate::people::Own::new(self.effective_config().iter().flat_map(|c| {
+            std::iter::once(c.email.clone()).chain(c.aliases.iter().map(|a| a.address()))
+        }))
     }
 
     /// Fold an account's locally-kept tags (POP3, keyword-less servers) into
@@ -18097,9 +18418,9 @@ impl AppModel {
         // In this tag's own view an untagged message has no row to keep.
         if !add
             && self
-                .tag_view
+                .index_view
                 .as_ref()
-                .is_some_and(|(_, v)| v.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(keyword)))
+                .is_some_and(|v| matches!(v, IndexView::Tag(_, Some(v)) if v.eq_ignore_ascii_case(keyword)))
         {
             self.message_list.emit(MessageListInput::Remove(id));
         }
@@ -18108,8 +18429,8 @@ impl AppModel {
     fn refresh_list_display(&self) {
         if self.unified {
             self.emit_unified();
-        } else if self.tag_view.is_some() {
-            self.show_tag_view();
+        } else if self.index_view.is_some() {
+            self.show_index_view();
         } else if let Some(sel) = self.selected.as_ref() {
             if let Some(msgs) = self.message_cache.get(&(sel.account_id, sel.folder_id)) {
                 self.message_list.emit(MessageListInput::SetMessages { messages: msgs.clone() });
@@ -19004,6 +19325,7 @@ impl AppModel {
             }
         }
         self.push_unread_counts();
+        self.adjust_people_unread(m, read);
     }
 
     /// Fill a message's body from the cache if it isn't already loaded, so

@@ -229,6 +229,9 @@ pub enum Sel {
     Attachments,
     /// The in-app contacts view.
     Contacts,
+    /// The People view: picked in the People pane, so no row here is lit
+    /// (and the sidebar does not pick a view of its own meanwhile).
+    People,
     Outbox,
     Folder(u32, String),
     /// An account's inbox selected via the "All Inboxes" sub-list.
@@ -4009,6 +4012,7 @@ impl Sidebar {
             Sel::Unified => self.select_unified(),
             Sel::Attachments => self.select_attachments(),
             Sel::Contacts => self.select_contacts(),
+            Sel::People => {}
             Sel::Outbox => self.select_outbox(),
             Sel::Folder(acc, path) => self.select_folder(acc, &path),
             Sel::UnifiedInbox(acc) => self.select_unified_inbox(acc),
